@@ -95,6 +95,9 @@ class AdvancedFootballPredictor:
         for match in matches:
             is_home = match['homeTeam']['shortName'] == team_name
             winner = match.get('score', {}).get('winner')
+            print(is_home)
+            print(match)
+            print(team_name)
             
             # Determine result
             if winner == 'DRAW':
@@ -200,7 +203,7 @@ class AdvancedFootballPredictor:
         # Predict
         prediction = model_result['model'].predict(input_scaled)[0]
         probabilities = model_result['model'].predict_proba(input_scaled)[0]
-        
+
         
         # Interpret prediction
         if prediction == 0:
@@ -234,69 +237,96 @@ class FootballDataFetcher:
         self.api_key = api_key
         self.base_url = "http://api.football-data.org/v4"
         self.headers = {'X-Auth-Token': api_key}
-        self.competitions = {
-            'PL': 2021,    # Premier League
-            'PD': 2014,    # La Liga
-            'BL1': 2002,   # Bundesliga
-            'SA': 2019,    # Serie A
-            'FL1': 2015,   # Ligue 1
-            'CL': 2001     # UEFA Champions League
-        }
         self._team_id_cache = {}
         self._team_matches_cache = {}
+        self._competition_cache = {}
+        self._initialize_competitions()
+
+    def _initialize_competitions(self):
+        """Fetch and cache all available competitions"""
+        try:
+            url = f"{self.base_url}/competitions"
+            response = requests.get(url, headers=self.headers)
+            
+            if response.status_code == 200:
+                competitions = response.json().get('competitions', [])
+                for comp in competitions:
+                    comp_id = comp.get('id')
+                    if comp_id:
+                        self._competition_cache[comp_id] = {
+                            'name': comp.get('name'),
+                            'type': comp.get('type'),
+                            'country': comp.get('area', {}).get('name')
+                        }
+            else:
+                logging.error(f"Failed to fetch competitions: {response.status_code}")
+                
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error initializing competitions: {str(e)}")
 
     def get_team_id(self, team_name: str) -> int:
-        """Get team ID with caching and improved name matching"""
-        # Check cache first
+        """Get team ID with comprehensive search across all competitions"""
         if team_name in self._team_id_cache:
             return self._team_id_cache[team_name]
 
-        for competition_id in self.competitions.values():
+        def normalize_team_name(name):
+            """Normalize team name for better matching"""
+            common_prefixes = [
+                'fc', 'ac', 'sc', 'rs', 'fk', 'as', 'cd', 'cf', 'rc', 'real',
+                'sociedade esportiva', 'clube', 'esporte clube', 'futebol clube',
+                'associação', 'sport club', 'sporting', 'sports', 'athletic',
+                'atletico', 'atlético', 'club', 'clubo', 'clube de', 'club de'
+            ]
+            name = name.lower().strip()
+            for prefix in common_prefixes:
+                name = name.replace(prefix, '').strip()
+            return name
+
+        search_name = normalize_team_name(team_name)
+        
+        # Search through all competitions systematically
+        for comp_id in self._competition_cache.keys():
             try:
-                url = f"{self.base_url}/competitions/{competition_id}/teams"
+                url = f"{self.base_url}/competitions/{comp_id}/teams"
                 response = requests.get(url, headers=self.headers)
                 
                 if response.status_code == 200:
                     teams = response.json().get('teams', [])
                     
-                    # Normalize the search team name
-                    search_name = team_name.lower().strip()
-                    
                     for team in teams:
-                        # Check multiple name variations
                         team_variations = [
-                            team.get('name', '').lower(),
-                            team.get('shortName', '').lower(),
-                            team.get('tla', '').lower()
+                            normalize_team_name(team.get('name', '')),
+                            normalize_team_name(team.get('shortName', '')),
+                            team.get('tla', '').lower(),
+                            normalize_team_name(team.get('name', '').split('FC')[0]),
+                            normalize_team_name(team.get('name', '').split('AC')[0])
                         ]
                         
-                        # Special case handling for common variations
-                        if 'united' in search_name:
-                            team_variations.append(team.get('name', '').lower().replace('united', 'utd'))
+                        # Remove empty strings and duplicates
+                        team_variations = list(set(var.strip() for var in team_variations if var))
                         
-                        # Check if search name matches any variation
                         if any(search_name in variation or variation in search_name 
-                              for variation in team_variations if variation):
-                            # Cache the result
+                              for variation in team_variations):
                             self._team_id_cache[team_name] = team['id']
                             return team['id']
                 
                 elif response.status_code == 429:
-                    # Rate limit handling
                     print("Rate limit reached. Waiting 60 seconds...")
                     time.sleep(60)
                     continue
+                elif response.status_code == 403:
+                    # Skip competitions we don't have access to
+                    continue
                     
             except requests.exceptions.RequestException as e:
-                logging.error(f"Error fetching teams for competition {competition_id}: {str(e)}")
-                time.sleep(5)  # Wait before retrying
+                logging.error(f"Error fetching teams for competition {comp_id}: {str(e)}")
+                time.sleep(5)
                 continue
                 
         raise ValueError(f"Team not found: {team_name}. Please check the team name and try again.")
-        
+
     def get_team_matches(self, team_id: int, days: int = 90) -> List[Dict]:
-        """Get recent matches for a team with caching and rate limit handling"""
-        # Check cache first
+        """Get recent matches from all competitions"""
         cache_key = (team_id, days)
         if cache_key in self._team_matches_cache:
             return self._team_matches_cache[cache_key]
@@ -309,21 +339,26 @@ class FootballDataFetcher:
             'dateFrom': from_date,
             'dateTo': to_date,
             'status': 'FINISHED',
-            'competitions': ','.join([str(comp_id) for comp_id in [2021, 2016]]),  # Premier League and Championship IDs
-            'limit': 20
+            'limit': 100  # Increased limit to get more matches
         }
         
         try:
             response = requests.get(url, headers=self.headers, params=params)
             if response.status_code == 200:
                 matches = response.json().get('matches', [])
+                
+                # Enrich match data with competition info
+                for match in matches:
+                    comp_id = match.get('competition', {}).get('id')
+                    if comp_id in self._competition_cache:
+                        match['competition_info'] = self._competition_cache[comp_id]
+                
                 sorted_matches = sorted(matches, key=lambda x: x.get('utcDate', ''), reverse=True)
                 
                 # Cache the result
                 self._team_matches_cache[cache_key] = sorted_matches
                 return sorted_matches
             elif response.status_code == 429:
-                # Rate limit handling
                 print("Rate limit reached. Waiting 60 seconds...")
                 time.sleep(60)
                 return self.get_team_matches(team_id, days)
@@ -332,8 +367,12 @@ class FootballDataFetcher:
                 
         except requests.exceptions.RequestException as e:
             logging.error(f"Error fetching matches: {str(e)}")
-            time.sleep(5)  # Wait before retrying
+            time.sleep(5)
             raise Exception(f"Error fetching matches: {str(e)}")
+
+    def get_available_competitions(self) -> Dict:
+        """Return list of available competitions"""
+        return self._competition_cache
 
 class FootballPredictor:
     def __init__(self, api_key: str):
@@ -341,21 +380,18 @@ class FootballPredictor:
         self.logger = logging.getLogger(__name__)
         
     def predict_match(self, home_team: str, away_team: str) -> Dict:
-        """Make match prediction with reduced API calls"""
+        """Make match prediction considering all competitions"""
         try:
-            # Single API call for team IDs
             home_id = self.data_fetcher.get_team_id(home_team)
             away_id = self.data_fetcher.get_team_id(away_team)
             
-            # Single API call for matches for both teams
             home_matches = self.data_fetcher.get_team_matches(home_id, days=90)
             away_matches = self.data_fetcher.get_team_matches(away_id, days=90)
             
-            # Rest of the prediction logic remains the same
             home_form = self._calculate_team_form(home_matches, home_team)
             away_form = self._calculate_team_form(away_matches, away_team)
             
-            # Prediction calculation logic
+            # Enhanced prediction calculation
             home_points = home_form['form_points']
             away_points = away_form['form_points']
             max_possible_points = 30
@@ -363,10 +399,14 @@ class FootballPredictor:
             home_form_factor = (home_points / max_possible_points) * 100
             away_form_factor = (away_points / max_possible_points) * 100
             
+            # Consider goal scoring and conceding records
+            home_goal_factor = home_form['avg_goals_scored'] - home_form['avg_goals_conceded']
+            away_goal_factor = away_form['avg_goals_scored'] - away_form['avg_goals_conceded']
+            
             home_advantage = 7
             
-            home_win_prob = (home_form_factor + home_advantage) * 0.6
-            away_win_prob = away_form_factor * 0.5
+            home_win_prob = (home_form_factor + home_advantage + (home_goal_factor * 5)) * 0.6
+            away_win_prob = (away_form_factor + (away_goal_factor * 5)) * 0.5
             
             form_difference = abs(home_points - away_points)
             draw_prob = max(20, 30 - form_difference * 2)
@@ -383,11 +423,15 @@ class FootballPredictor:
                 'team_form': {
                     'home': {
                         'recent_form': home_form['form_trend'],
-                        'form_points': home_form['form_points']
+                        'form_points': home_form['form_points'],
+                        'avg_goals_scored': round(home_form['avg_goals_scored'], 2),
+                        'avg_goals_conceded': round(home_form['avg_goals_conceded'], 2)
                     },
                     'away': {
                         'recent_form': away_form['form_trend'],
-                        'form_points': away_form['form_points']
+                        'form_points': away_form['form_points'],
+                        'avg_goals_scored': round(away_form['avg_goals_scored'], 2),
+                        'avg_goals_conceded': round(away_form['avg_goals_conceded'], 2)
                     }
                 }
             }
@@ -397,29 +441,22 @@ class FootballPredictor:
             raise
 
     def _calculate_team_form(self, matches: List[Dict], team_name: str) -> Dict:
-        """Calculate team form based on 5 most recent LEAGUE matches"""
+        """Calculate team form based on recent matches from all competitions"""
         form_data = {
             'results': [],
             'goals_scored': [],
             'goals_conceded': [],
         }
         
-        # Process only Premier League matches and sort by date
-        league_matches = [
-            match for match in matches 
-            if match.get('competition', {}).get('type') == 'LEAGUE'
-            and match.get('status') == 'FINISHED'
-        ]
+        # Use all matches but prioritize domestic league matches
+        sorted_matches = sorted(matches, 
+                              key=lambda x: (x.get('competition', {}).get('type') == 'LEAGUE', x['utcDate']),
+                              reverse=True)
         
-        # Sort matches by date in descending order (most recent first)
-        league_matches.sort(key=lambda x: x['utcDate'], reverse=True)
-        
-        # Take only the 5 most recent league matches
-        for match in league_matches[:10]:
+        for match in sorted_matches[:10]:  # Consider last 10 matches
             winner = match.get('score', {}).get('winner')
             is_home = match['homeTeam']['shortName'] == team_name
             
-            # Determine result based on winner and team position
             if winner == 'DRAW':
                 form_data['results'].append('D')
             elif winner == 'HOME_TEAM':
@@ -427,7 +464,6 @@ class FootballPredictor:
             elif winner == 'AWAY_TEAM':
                 form_data['results'].append('W' if not is_home else 'L')
             
-            # Track goals
             score = match.get('score', {}).get('fullTime', {})
             if is_home:
                 goals_scored = score.get('home', 0)
@@ -439,7 +475,6 @@ class FootballPredictor:
             form_data['goals_scored'].append(goals_scored)
             form_data['goals_conceded'].append(goals_conceded)
         
-        # Calculate form points
         points_map = {'W': 3, 'D': 1, 'L': 0}
         form_points = sum(points_map[result] for result in form_data['results'])
         
@@ -449,6 +484,7 @@ class FootballPredictor:
             'avg_goals_conceded': np.mean(form_data['goals_conceded']) if form_data['goals_conceded'] else 0,
             'form_points': form_points
         }
+
 
 def format_predictions(home_team, away_team, original_pred, rf_pred):
    return f"""
@@ -483,9 +519,10 @@ if __name__ == "__main__":
     advanced_predictor = AdvancedFootballPredictor(predictor)
     
     try:
-        # Let's debug the match fetching
-        home_team = "Leicester City"
-        away_team = "Chelsea"
+        # Let's debug the match
+        #  fetching
+        home_team = "Cuiabá EC"
+        away_team = "Flamengo"
        # Original method prediction
         original_prediction = predictor.predict_match(home_team, away_team)
         
